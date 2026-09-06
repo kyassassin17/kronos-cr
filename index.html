@@ -491,10 +491,11 @@
   <div class="auth-box">
     <h3 class="auth-title">Admin</h3>
     <p class="auth-sub">Panel de administración</p>
-    <input class="auth-input" type="password" id="admin-pass" placeholder="Contraseña" onkeydown="if(event.key==='Enter')checkAuth()">
-    <button class="auth-btn" onclick="checkAuth()">Ingresar</button><br>
+    <input class="auth-input" type="email" id="admin-email" placeholder="Correo" autocomplete="username" onkeydown="if(event.key==='Enter')checkAuth()">
+    <input class="auth-input" type="password" id="admin-pass" placeholder="Contraseña" autocomplete="current-password" onkeydown="if(event.key==='Enter')checkAuth()">
+    <button class="auth-btn" id="auth-btn" onclick="checkAuth()">Ingresar</button><br>
     <button class="auth-cancel" onclick="closeAuth()">Cancelar</button>
-    <p class="auth-error" id="auth-error">Contraseña incorrecta</p>
+    <p class="auth-error" id="auth-error">Credenciales incorrectas</p>
   </div>
 </div>
 
@@ -508,6 +509,7 @@
         <button class="admin-tab" onclick="switchAdminTab('payments',this)">Pagos</button>
       </div>
       <button class="admin-close" onclick="closeAdmin()">← Volver</button>
+      <button class="admin-close" id="btn-logout" onclick="logoutAdmin()" title="Cerrar sesión">Salir</button>
     </div>
   </div>
   <div class="admin-body">
@@ -515,8 +517,8 @@
     <div class="config-banner" id="config-banner">
       <strong>⚙ Configuración inicial requerida</strong><br>
       Edita el archivo HTML y completa las variables en la sección <code>CONFIG</code>:<br>
-      <code>WHATSAPP_NUMBER</code> · <code>ADMIN_PASSWORD</code> · credenciales de Firebase<br>
-      Firebase gratuito: <a href="https://console.firebase.google.com" target="_blank" style="color:var(--text);">console.firebase.google.com</a> → activa Firestore + Storage.
+      <code>WHATSAPP_NUMBER</code> · credenciales de Firebase<br>
+      Firebase gratuito: <a href="https://console.firebase.google.com" target="_blank" style="color:var(--text);">console.firebase.google.com</a> → activa Firestore + Storage + Authentication (Correo/Contraseña) y crea el usuario administrador.
     </div>
 
     <!-- TAB: CATÁLOGO -->
@@ -657,7 +659,8 @@
 // ─────────────────────────────────────────────
 const CONFIG = {
   WHATSAPP_NUMBER: "+50687143820",   // Con código de país, sin + ni espacios
-  ADMIN_PASSWORD:  "Negro321.",    // Cambia esta contraseña
+  // El acceso al panel usa Firebase Authentication (Correo/Contraseña).
+  // Crea el usuario admin en Firebase Console → Authentication → Users.
   FIREBASE_API_KEY:             "AIzaSyDcgbU3kPkK7loYrGJAcCbnRqXkc_gDf8s",
   FIREBASE_AUTH_DOMAIN:         "kronos-cr.firebaseapp.com",
   FIREBASE_PROJECT_ID:          "kronos-cr",
@@ -670,8 +673,9 @@ const CONFIG = {
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, setDoc, getDoc, query, orderBy } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserSessionPersistence } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
-let db, storage, watches = [], firebaseReady = false;
+let db, storage, auth, adminUser = null, watches = [], firebaseReady = false;
 let currentWatch = null;
 const MAX_IMAGES = 10;
 
@@ -705,6 +709,15 @@ try {
     });
     db = getFirestore(app);
     storage = getStorage(app);
+    auth = getAuth(app);
+    // Session persistence: the admin stays signed in until the tab is closed
+    setPersistence(auth, browserSessionPersistence).catch(()=>{});
+    onAuthStateChanged(auth, user => {
+      adminUser = user;
+      if (!user && document.getElementById("admin-panel").classList.contains("open")) {
+        closeAdmin(); showToast("Sesión cerrada", "success");
+      }
+    });
     firebaseReady = true;
     document.getElementById("config-banner").style.display = "none";
     loadAll();
@@ -799,7 +812,7 @@ window.savePaymentConfig = async () => {
   if (firebaseReady) {
     try {
       await setDoc(doc(db, "config", "payment"), data);
-    } catch(e) { showPayMsg("Error al guardar: " + e.message, "error"); return; }
+    } catch(e) { showPayMsg(e.code==="permission-denied" ? "Sin permisos: inicia sesión de nuevo" : "Error al guardar: " + e.message, "error"); return; }
   } else {
     try { localStorage.setItem("kronos_pay", JSON.stringify(data)); } catch(e) {}
   }
@@ -1007,27 +1020,57 @@ window.copySinpe = () => {
 document.getElementById("wa-contact-link").href =
   `https://wa.me/${CONFIG.WHATSAPP_NUMBER}?text=${encodeURIComponent("Hola, me gustaría consultar sobre el catálogo de relojes japoneses de Kronos CR.")}`;
 
-// ── AUTH ──
+// ── AUTH (Firebase Authentication — Correo/Contraseña) ──
 window.openAdminAuth = () => {
+  // Already signed in → open the panel directly
+  if (adminUser || !firebaseReady) { openAdminPanel(); return; }
   document.getElementById("auth-overlay").classList.add("open");
-  setTimeout(() => document.getElementById("admin-pass").focus(), 100);
+  setTimeout(() => document.getElementById("admin-email").focus(), 100);
 };
 window.closeAuth = () => {
   document.getElementById("auth-overlay").classList.remove("open");
   document.getElementById("admin-pass").value = "";
   document.getElementById("auth-error").style.display = "none";
 };
-window.checkAuth = () => {
-  if (document.getElementById("admin-pass").value === CONFIG.ADMIN_PASSWORD) {
-    closeAuth();
-    document.getElementById("admin-panel").classList.add("open");
-    renderAdminList(watches);
-    initSpecs();
-    applyPayConfig();
-  } else {
-    document.getElementById("auth-error").style.display = "block";
+function openAdminPanel() {
+  closeAuth();
+  document.getElementById("admin-panel").classList.add("open");
+  document.getElementById("btn-logout").style.display = firebaseReady ? "" : "none";
+  renderAdminList(watches);
+  initSpecs();
+  applyPayConfig();
+}
+const AUTH_ERRORS = {
+  "auth/invalid-credential": "Correo o contraseña incorrectos",
+  "auth/wrong-password": "Correo o contraseña incorrectos",
+  "auth/user-not-found": "Correo o contraseña incorrectos",
+  "auth/invalid-email": "Correo no válido",
+  "auth/too-many-requests": "Demasiados intentos. Intenta de nuevo en unos minutos",
+  "auth/network-request-failed": "Sin conexión. Revisa tu internet",
+  "auth/operation-not-allowed": "Activa Correo/Contraseña en Firebase → Authentication",
+};
+window.checkAuth = async () => {
+  const email = document.getElementById("admin-email").value.trim();
+  const pass = document.getElementById("admin-pass").value;
+  const err = document.getElementById("auth-error");
+  const btn = document.getElementById("auth-btn");
+  if (!email || !pass) { err.textContent = "Ingresa correo y contraseña"; err.style.display = "block"; return; }
+  btn.disabled = true; btn.textContent = "Verificando...";
+  try {
+    const cred = await signInWithEmailAndPassword(auth, email, pass);
+    adminUser = cred.user;
+    openAdminPanel();
+  } catch(e) {
+    err.textContent = AUTH_ERRORS[e.code] || "No se pudo iniciar sesión";
+    err.style.display = "block";
     document.getElementById("admin-pass").value = "";
   }
+  btn.disabled = false; btn.textContent = "Ingresar";
+};
+window.logoutAdmin = async () => {
+  if (!firebaseReady) { closeAdmin(); return; }
+  try { await signOut(auth); } catch(e) {}
+  adminUser = null; closeAdmin(); showToast("Sesión cerrada", "success");
 };
 window.closeAdmin = () => document.getElementById("admin-panel").classList.remove("open");
 
@@ -1133,7 +1176,7 @@ window.submitWatch = async () => {
   if (pending) btn.textContent = `Subiendo ${pending} foto${pending>1?"s":""}...`;
   try {
     images = await uploadFormImages();
-  } catch(e) { showMsg("Error subiendo imágenes: " + e.message,"error"); btn.disabled=false; btn.textContent=editingId?"Guardar cambios":"Agregar Reloj"; return; }
+  } catch(e) { showMsg(e.code==="storage/unauthorized" ? "Sin permisos para subir fotos: inicia sesión de nuevo" : "Error subiendo imágenes: " + e.message,"error"); btn.disabled=false; btn.textContent=editingId?"Guardar cambios":"Agregar Reloj"; return; }
   btn.textContent = "Guardando...";
   // `imageUrl` is kept in sync with the cover photo for backwards compatibility
   const data = { name, brand, category: document.getElementById("f-category").value.trim(), price, description: document.getElementById("f-desc").value.trim(), specs, images, imageUrl: images[0] || "" };
@@ -1148,7 +1191,7 @@ window.submitWatch = async () => {
     if (editingId) await updateDoc(doc(db,"watches",editingId), data);
     else { data.createdAt=new Date(); await addDoc(collection(db,"watches"), data); }
     await loadWatches(); resetForm(); showMsg(editingId?"¡Reloj actualizado!":"¡Reloj agregado!","success"); editingId=null;
-  } catch(e) { showMsg("Error: "+e.message,"error"); }
+  } catch(e) { showMsg(e.code==="permission-denied" ? "Sin permisos: inicia sesión de nuevo" : "Error: "+e.message,"error"); }
   btn.disabled=false; btn.textContent=editingId?"Guardar cambios":"Agregar Reloj";
 };
 window.cancelEdit = () => { editingId=null; resetForm(); };
